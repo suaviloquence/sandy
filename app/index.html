@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+	<title>sandy</title>
+	<meta charset="utf-8" />
+
+	<script>
+		const BITRATE_TABLE = [
+			// 00:  MPEG 2.5
+			[
+				// 00: invalid
+				[],
+				// 01: V3
+				[8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160], ,
+				// 10: V2
+				[8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160], ,
+				// 11: V1
+				[
+					32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256,
+				],
+			],
+			// 01: invalid
+			[],
+			// 10: MPEG 2
+			[
+				// 00: invalid
+				[],
+				// 01: V3
+				[8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160], ,
+				// 10: V2
+				[8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160], ,
+				// 11: V1
+				[
+					32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256,
+				],
+
+			],
+			// 11: MPEG 1
+			[
+				// 00: invalid
+				[],
+				// 01: V3
+				[
+					32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+				],
+				// 10: V2
+				[
+
+					32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384,
+				],
+				// 11: V1
+				[
+					32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448,
+				]
+			],
+		];
+
+		const SAMPLE_RATE_TABLE = [
+			// 00: V2.5
+			[11025, 12000, 8000],
+			// 01: invalid
+			[],
+			// 10: V2
+			[22050, 24000, 8000],
+			// 11: V1
+			[44100, 48000, 32000],
+		];
+
+		function frameSize(header) {
+			let version = (header[1] >> 3) & 0b11;
+			let layer = (header[1] >> 1) & 0b11;
+			let bitrate_idx = ((header[2] >> 4) & 0b1111);
+			let sample_idx = (header[2] >> 2) & 0b11;
+			let padding = (header[2] >> 1) & 0b1;
+
+			let bitrate = BITRATE_TABLE[version][layer][bitrate_idx - 1] * 1000;
+			let sample_rate = SAMPLE_RATE_TABLE[version][sample_idx];
+
+			if (layer === 0b11) {
+				return 4 * (12 * bitrate / sample_rate + padding);
+			} else {
+				return 144 * bitrate / sample_rate + padding;
+			}
+		}
+
+		async function updateQueue() {
+			const queue = document.getElementById("queue");
+			// clear children
+			queue.replaceChildren();
+
+			let response = await fetch("/queue");
+			let text = await response.text();
+			let lines = text.split('\n');
+
+			for (let i = 0; i < lines.length / 2 - 1; i++) {
+				const li = document.createElement("li");
+				li.textContent = `${lines[2 * i]} - ${lines[2 * i + 1]}`;
+				queue.appendChild(li);
+			}
+		}
+
+		async function updateNowPlaying(title, artist) {
+			const header = document.getElementById("now-playing");
+
+			if (!title) {
+				let response = await fetch("/now");
+				let text = await response.text();
+				let lines = text.split('\n');
+
+				title = lines[1];
+				artist = lines[0];
+			}
+
+			header.textContent = `${artist} - ${title}`;
+		}
+
+		async function skipNext() {
+			this.disabled = true;
+			let response = await fetch("/skip");
+			let text = await response.text();
+
+			if (text === "OK") await updateQueue();
+
+			this.disabled = false;
+		}
+
+		async function startStream() {
+			// already streaming
+			if (this.loop ?? false) return;
+			this.loop = true;
+
+			this.textContent = "Stop";
+			this.addEventListener("click", () => {
+				this.loop = false;
+				this.textContent = "Start";
+			}, { once: true });
+
+			const audio = document.getElementById("stream");
+			const source = new MediaSource();
+			audio.src = URL.createObjectURL(source);
+
+
+
+			source.addEventListener("sourceopen", async () => {
+				const response = await fetch("/stream");
+				const body = await response.body;
+				const reader = body.getReader();
+
+				const buffers = source.addSourceBuffer("audio/mpeg");
+
+				const frames = new Uint8Array(384 * 128);
+				let pos = 0;
+
+				/**
+					* @param {Uint8Array} frame 
+				*/
+				async function pushFrame(frame) {
+					if (frame.length + pos < frames.length) {
+						frames.set(frame, pos);
+						pos += frame.length;
+
+						if (frame.length + pos >= frames.length) {
+							buffers.appendBuffer(frames.buffer.slice(0, pos));
+
+							pos = 0;
+							frames.fill(0);
+						}
+					} else {
+						throw new Error("TODO");
+					}
+				}
+
+
+				let buffer = new Uint8Array();
+				let need = 0;
+
+				while (this.loop) {
+					const { done, value } = await reader.read();
+					if (done) break;
+
+					let cursor = 0;
+
+
+					while (cursor < value.length && this.loop) {
+						if (need === 0) {
+							if (value[cursor] === 0xFF && value[cursor + 1] & 0b11100000 === 0b11100000) {
+								let header = value.slice(cursor, cursor + 4);
+								// includes header
+								let frame_size = frameSize(header);
+
+								if (cursor + frame_size < value.length) {
+									let frame = value.slice(cursor, cursor + frame_size);
+									cursor += frame_size;
+									await pushFrame(frame);
+								} else {
+									buffer = new Uint8Array(frame_size);
+									buffer.set(value.slice(cursor));
+									need = frame_size + cursor - value.length;
+									cursor = value.length;
+								}
+							} else {
+								break;
+								let title_len = value[cursor] << 8 + value[cursor + 1];
+								cursor += 2;
+								let title = new TextDecoder().decode(value.slice(cursor, cursor + title_len));
+								cursor += title_len;
+
+								let artist_len = value[cursor] << 8 + value[cursor + 1];
+								cursor += 2;
+								let artist = new TextDecoder().decode(value.slice(cursor, cursor + artist_len));
+								cursor += artist_len;
+
+								await updateNowPlaying(title, artist);
+								await updateQueue();
+							}
+						} else {
+							if (cursor + need < value.length) {
+								buffer.set(value.slice(cursor, cursor + need), buffer.length - need);
+								cursor += need;
+
+								need = 0;
+								await pushFrame(buffer);
+							} else {
+								buffer.set(value.slice(cursor), buffer.length - need);
+								need -= value.length - cursor;
+
+								cursor = value.length;
+							}
+						}
+					}
+				}
+			});
+		}
+
+		document.addEventListener("DOMContentLoaded", async () => {
+			document.getElementById("skip").addEventListener("click", skipNext);
+			document.getElementById("start").addEventListener("click", startStream);
+			await Promise.all([updateQueue(), updateNowPlaying()]);
+		});
+	</script>
+</head>
+
+<body>
+	<h1 id="now-playing">Artist - Title</h1>
+	<ol id="queue"></ol>
+	<div>
+		<button id="start">Start</button>
+	</div>
+	<audio id="stream"></audio>
+	<div>
+		<button id="skip">Skip next song</button>
+	</div>
+</body>
+
+</html>
