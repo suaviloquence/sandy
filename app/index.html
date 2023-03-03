@@ -86,12 +86,13 @@
 
 		async function updateQueue() {
 			const queue = document.getElementById("queue");
-			// clear children
-			queue.replaceChildren();
 
 			let response = await fetch("/queue");
 			let text = await response.text();
 			let lines = text.split('\n');
+
+			// clear children
+			queue.replaceChildren();
 
 			for (let i = 0; i < lines.length / 2 - 1; i++) {
 				const li = document.createElement("li");
@@ -108,16 +109,23 @@
 				let text = await response.text();
 				let lines = text.split('\n');
 
-				title = lines[1];
-				artist = lines[0];
+				title = lines[0];
+				artist = lines[1];
 			}
 
-			header.textContent = `${artist} - ${title}`;
+			header.textContent = `${title} - ${artist}`;
+		}
+
+		async function skipCurr() {
+			this.disabled = true;
+			const response = await fetch("/skip/curr");
+			if (response.ok) await updateNowPlaying();
+			this.disabled = false;
 		}
 
 		async function skipNext() {
 			this.disabled = true;
-			let response = await fetch("/skip");
+			let response = await fetch("/skip/next");
 			let text = await response.text();
 
 			if (text === "OK") await updateQueue();
@@ -234,7 +242,8 @@
 		}
 
 		document.addEventListener("DOMContentLoaded", async () => {
-			document.getElementById("skip").addEventListener("click", skipNext);
+			document.getElementById("skip-curr").addEventListener("click", skipCurr);
+			document.getElementById("skip-next").addEventListener("click", skipNext);
 			document.getElementById("start").addEventListener("click", startStream);
 			await Promise.all([updateQueue(), updateNowPlaying()]);
 		});
@@ -249,7 +258,8 @@
 	</div>
 	<audio id="stream"></audio>
 	<div>
-		<button id="skip">Skip next song</button>
+		<button id="skip-curr">Skip current song</button>
+		<button id="skip-next">Skip next song</button>
 	</div>
 </body>
 

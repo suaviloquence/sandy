@@ -1,11 +1,10 @@
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+
 use crate::playlist::SongMetadata;
 
 use self::data::{Layer, Version};
 
-use super::{
-	id3::{self, Id3},
-	Song,
-};
+use super::{id3::Id3, Song};
 use std::io::{self, BufRead, BufReader, Cursor, Read, Seek};
 
 mod data;
@@ -89,6 +88,12 @@ impl Header {
 pub struct Frame {
 	pub header: Header,
 	pub data: Vec<u8>,
+}
+
+impl Frame {
+	pub async fn write(&self, mut w: impl AsyncWrite + Unpin) -> io::Result<usize> {
+		Ok(w.write(&self.header[..]).await? + w.write(&self.data).await?)
+	}
 }
 
 #[derive(Debug)]

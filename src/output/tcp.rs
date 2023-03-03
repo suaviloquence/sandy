@@ -12,13 +12,10 @@ use futures::{future, StreamExt};
 use tokio::{
 	io::AsyncWriteExt,
 	net::{tcp::OwnedWriteHalf, TcpListener},
-	sync::{mpsc, Mutex, RwLock},
+	sync::{mpsc, Mutex},
 };
 
-use crate::{
-	playlist::SongMetadata,
-	song::{id3::Id3, mp3::Frame},
-};
+use crate::runner::Current;
 
 use super::Message;
 
@@ -26,17 +23,17 @@ use super::Message;
 pub struct Tcp {
 	rx: mpsc::Receiver<Arc<Message>>,
 	conns: Arc<Mutex<HashMap<usize, mpsc::Sender<Arc<Message>>>>>,
-	curr_id: Arc<RwLock<Vec<u8>>>,
 	idx: AtomicUsize,
+	current: Current,
 }
 
 impl Tcp {
-	pub fn new(rx: mpsc::Receiver<Arc<Message>>, curr: &SongMetadata) -> Self {
+	pub fn new(rx: mpsc::Receiver<Arc<Message>>, current: Current) -> Self {
 		Self {
 			rx,
-			curr_id: Arc::new(RwLock::new(Id3::from_song(curr).as_bytes())),
 			conns: Default::default(),
 			idx: AtomicUsize::new(0),
+			current,
 		}
 	}
 
@@ -44,14 +41,10 @@ impl Tcp {
 		let queue = {
 			let mut rx = self.rx;
 			let conns = Arc::clone(&self.conns);
-			let curr = Arc::clone(&self.curr_id);
 
 			async move {
 				while let Some(msg) = rx.recv().await {
 					match msg.as_ref() {
-						Message::Next(next) => {
-							*curr.write().await = Id3::from_song(next).as_bytes();
-						}
 						Message::Frames(_) => {
 							let mut conns_guard = conns.lock().await;
 
@@ -68,6 +61,7 @@ impl Tcp {
 								conns_guard.remove(failure);
 							}
 						}
+						_ => (),
 					}
 				}
 			}
@@ -75,7 +69,7 @@ impl Tcp {
 
 		let server = {
 			let conns = Arc::clone(&self.conns);
-			let curr = Arc::clone(&self.curr_id);
+			let current = self.current.clone();
 
 			async move {
 				let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 3615))).await?;
@@ -90,11 +84,11 @@ impl Tcp {
 								.await
 								.insert(self.idx.fetch_add(1, Ordering::SeqCst), sx);
 
-							let curr = Arc::clone(&curr);
+							let current = current.clone();
 
 							tokio::spawn(async move {
-								if let Err(e) = writer_loop(rx, writer, curr).await {
-									log::error!("Write to stream error: {:?}", e);
+								if let Err(e) = writer_loop(rx, writer, current).await {
+									log::info!("Write to stream error: {:?}", e);
 								}
 							});
 
@@ -113,16 +107,19 @@ impl Tcp {
 async fn writer_loop(
 	mut rx: mpsc::Receiver<Arc<Message>>,
 	mut writer: OwnedWriteHalf,
-	curr: Arc<RwLock<Vec<u8>>>,
+	current: Current,
 ) -> io::Result<()> {
-	writer.write(&curr.read().await).await?;
+	let guard = current.chunk.read().await;
+	if let Some(frames) = guard.as_ref() {
+		for frame in frames {
+			frame.write(&mut writer).await?;
+		}
+		writer.flush().await?;
+	}
+
+	drop(guard);
 
 	while let Some(msg) = rx.recv().await {
-		if writer.writable().await.is_err() {
-			rx.close();
-			// TODO: break vs continue
-			break;
-		}
 		match msg.as_ref() {
 			Message::Next(_) => {
 				// writer.write(&id3).await?;
@@ -130,8 +127,7 @@ async fn writer_loop(
 			}
 			Message::Frames(frames) => {
 				for frame in frames.iter() {
-					writer.write(&*frame.header).await?;
-					writer.write(&frame.data).await?;
+					frame.write(&mut writer).await?;
 				}
 
 				writer.flush().await?;

@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, ffi::OsStr, io, path::Path};
+use std::{collections::VecDeque, io, path::Path};
 
 use super::SongMetadata;
 
@@ -35,7 +35,9 @@ pub async fn glob(
 			if ok(&path) {
 				let title = path
 					.file_stem()
-					.expect("Empty file name")
+					.ok_or_else(|| {
+						io::Error::new(io::ErrorKind::InvalidInput, "Invalid file name")
+					})?
 					.to_string_lossy()
 					.into_owned();
 

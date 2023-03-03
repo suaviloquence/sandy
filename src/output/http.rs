@@ -1,5 +1,5 @@
 use std::{
-	collections::{HashMap, VecDeque},
+	collections::HashMap,
 	convert::Infallible,
 	fmt::Write,
 	net::SocketAddr,
@@ -7,25 +7,22 @@ use std::{
 		atomic::{AtomicUsize, Ordering},
 		Arc, Mutex,
 	},
-	time::Duration,
 };
 
-use futures::{future, StreamExt};
+use futures::StreamExt;
 use hyper::{
-	body::{Buf, Bytes},
+	body::Bytes,
 	header,
 	server::conn::AddrStream,
 	service::{make_service_fn, service_fn},
 	Body, Request, Response,
 };
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 
 use crate::{
 	playlist::{Playlist, SongMetadata},
-	song::{
-		mp3::{Frame, Mp3},
-		Song,
-	},
+	runner::{Control, ControlSender, Current},
+	song::mp3::Frame,
 };
 
 use super::{Message, Receiver, Sender};
@@ -85,10 +82,10 @@ impl BodyStream {
 #[derive(Debug, Clone)]
 struct State {
 	playlist: Arc<Mutex<Playlist>>,
-	curr: Arc<RwLock<SongMetadata>>,
-	curr_chunk: Arc<RwLock<Option<Vec<Frame>>>>,
+	current: Current,
 	conns: Arc<tokio::sync::Mutex<HashMap<usize, Sender>>>,
 	conn_idx: Arc<AtomicUsize>,
+	control: ControlSender,
 }
 
 impl State {
@@ -97,7 +94,8 @@ impl State {
 			"/" => self.app().await,
 			"/queue" => self.queue().await,
 			"/stream" => self.stream().await,
-			"/skip" => self.skip().await,
+			"/skip/next" => self.skip_next().await,
+			"/skip/curr" => self.skip_curr().await,
 			"/now" => self.now().await,
 			path => Self::not_found(path).await,
 		}
@@ -124,7 +122,7 @@ impl State {
 			write!(
 				&mut writer,
 				"{}\n{}\n",
-				song.metadata.artist, song.metadata.title
+				song.metadata.title, song.metadata.artist
 			)
 			.expect("Error writing to buffer");
 		}
@@ -134,7 +132,7 @@ impl State {
 			.body(Body::from(writer))
 	}
 
-	async fn skip(self) -> hyper::http::Result<Response<Body>> {
+	async fn skip_next(self) -> hyper::http::Result<Response<Body>> {
 		let skipped = self
 			.playlist
 			.lock()
@@ -142,19 +140,38 @@ impl State {
 			.pop_front()
 			.is_some();
 
-		let text = if skipped { "OK" } else { "Empty" };
+		let (status, text) = if skipped { (200, "OK") } else { (400, "Empty") };
 
 		Response::builder()
+			.status(status)
 			.header(header::CONTENT_TYPE, "text/plain")
 			.body(Body::from(text))
 	}
 
-	async fn now(self) -> hyper::http::Result<Response<Body>> {
-		let guard = self.curr.read().await;
+	async fn skip_curr(self) -> hyper::http::Result<Response<Body>> {
+		self.control
+			.send(Control::SkipCurr)
+			.await
+			.expect("Error sending skip curr signal");
 
 		Response::builder()
-			.header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-			.body(Body::from(format!("{}\n{}", guard.artist, guard.title)))
+			.header(header::CONTENT_TYPE, "text/plain")
+			.body(Body::from("OK"))
+	}
+
+	async fn now(self) -> hyper::http::Result<Response<Body>> {
+		let guard = self.current.song.read().await;
+
+		if let Some(song) = guard.as_ref() {
+			Response::builder()
+				.header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+				.body(Body::from(format!("{}\n{}", song.title, song.artist)))
+		} else {
+			Response::builder()
+				.status(400)
+				.header(header::CONTENT_TYPE, "text/plain")
+				.body(Body::from("not playing"))
+		}
 	}
 
 	async fn stream(self) -> hyper::http::Result<Response<Body>> {
@@ -168,27 +185,32 @@ impl State {
 		let (sx, body) = Body::channel();
 		let mut sx = BodyStream(sx);
 
-		let mut data = BodyStream::metadata_to_bytes(&*self.curr.read().await);
-
-		dbg!(self.curr.try_read().is_err());
+		let metadata = self
+			.current
+			.song
+			.read()
+			.await
+			.as_ref()
+			.map(BodyStream::metadata_to_bytes);
 
 		let chunk = self
-			.curr_chunk
+			.current
+			.chunk
 			.read()
 			.await
 			.as_deref()
 			.map(BodyStream::frame_to_bytes);
 
-		if let Some(next) = chunk {
-			let len = data.len() + next.len();
-			data = data.chain(next).copy_to_bytes(len);
-		}
-
-		if !sx.send(data).await {
-			rx.close();
-		}
-
-		dbg!(self.curr_chunk.try_read().is_err());
+		match (metadata, chunk) {
+			(Some(metadata), Some(chunk)) => {
+				sx.send(metadata).await;
+				sx.send(chunk).await;
+			}
+			(Some(data), None) | (None, Some(data)) => {
+				sx.send(data).await;
+			}
+			(None, None) => (),
+		};
 
 		tokio::spawn(async move {
 			while let Some(msg) = rx.recv().await {
@@ -221,38 +243,26 @@ pub struct Server {
 }
 
 impl Server {
-	pub fn new(playlist: Arc<Mutex<Playlist>>, rx: Receiver) -> Self {
+	pub fn new(
+		rx: Receiver,
+		playlist: Arc<Mutex<Playlist>>,
+		current: Current,
+		control: ControlSender,
+	) -> Self {
 		Self {
 			rx,
 			state: State {
-				curr: Arc::new(RwLock::const_new({
-					let guard = playlist
-						.lock()
-						.expect("Error unlocking playlist in http::Server::new()");
-					let song = guard.front().expect("Playlist is empty").metadata.clone();
-
-					drop(guard);
-					song
-				})),
-				curr_chunk: Default::default(),
+				current,
 				conns: Default::default(),
 				conn_idx: Default::default(),
 				playlist,
+				control,
 			},
 		}
 	}
 
 	async fn worker(&mut self) {
 		while let Some(msg) = self.rx.recv().await {
-			match msg.as_ref() {
-				Message::Next(n) => *self.state.curr.write().await = n.clone(),
-				Message::Frames(f) => {
-					let mut guard = self.state.curr_chunk.write().await;
-					*guard = Some(f.clone());
-					drop(guard)
-				}
-			}
-
 			let mut conns_guard = self.state.conns.lock().await;
 
 			let failures: Vec<_> = futures::stream::iter(conns_guard.iter().map(|(idx, sx)| {
