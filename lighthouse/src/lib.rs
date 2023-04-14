@@ -235,7 +235,10 @@ mod tests {
     
     impl<T> PartialEq for Link<T> {
         fn eq(&self, other: &Self) -> bool {
-            self as *const _ == other as *const _
+            match (self, other) {
+                (Link::Next(a), Link::Next(b)) => a == b,
+                (Link::Tail())
+            }
         }
     }
 
@@ -266,7 +269,7 @@ mod tests {
             })))
         }));
         
-        let mut rx = Receiver { curr: head };
+
         assert_eq!(*rx.try_recv_or_get_tail().unwrap().unwrap(), 2);
         assert_eq!(rx.curr, head.next().next.into_inner().unwrap());
     }
