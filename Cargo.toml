@@ -13,3 +13,8 @@ hyper = { version = "0.14", features = ["full"] }
 hyper-tls = "0.5"
 log = "0.4"
 env_logger = "0.10"
+
+[workspace]
+members = [
+    "lighthouse",
+]

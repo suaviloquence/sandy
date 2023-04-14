@@ -12,6 +12,7 @@ mod output;
 mod playlist;
 mod runner;
 mod song;
+mod broadcast;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
