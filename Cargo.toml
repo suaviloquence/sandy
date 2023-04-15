@@ -14,8 +14,10 @@ hyper-tls = "0.5"
 log = "0.4"
 env_logger = "0.10"
 lighthouse = { path = "lighthouse" }
+id3 = { path = "id3" }
 
 [workspace]
 members = [
     "lighthouse",
+    "id3",
 ]

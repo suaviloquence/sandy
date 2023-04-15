@@ -6,6 +6,6 @@ pub mod tcp;
 
 #[derive(Debug)]
 pub enum Message {
-	Next(SongMetadata),
-	Frames(Vec<Frame>),
+    Next(SongMetadata),
+    Frames(Vec<Frame>),
 }

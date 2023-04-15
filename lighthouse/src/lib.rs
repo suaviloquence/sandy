@@ -27,7 +27,6 @@ impl<T> Default for Tail<T> {
     }
 }
 
-
 #[derive(Debug)]
 enum Link<T> {
     Next(NodeRef<T>),
@@ -164,9 +163,11 @@ pub struct MsgRef<T> {
     inner: NodeRef<T>,
 }
 
-impl<T> Clone for  MsgRef<T> {
+impl<T> Clone for MsgRef<T> {
     fn clone(&self) -> Self {
-        Self { inner: Arc::clone(&self.inner) }
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
     }
 }
 
@@ -221,9 +222,7 @@ impl<T> Future for RecvFut<T> {
 }
 
 impl<T> Receiver<T> {
-    fn try_recv_or_get_tail(
-        &mut self,
-    ) -> Result<Result<MsgRef<T>, TailRefWeak<T>>, RecvError> {
+    fn try_recv_or_get_tail(&mut self) -> Result<Result<MsgRef<T>, TailRefWeak<T>>, RecvError> {
         match &self.curr {
             Link::Next(node) => {
                 let next_guard = node.next.read().map_err(|_| RecvError)?;
@@ -292,7 +291,6 @@ impl<T> Receiver<T> {
 mod tests {
     use crate::*;
     type Err = Box<dyn std::error::Error>;
-
 
     impl<T: PartialEq> PartialEq for Node<T> {
         fn eq(&self, other: &Self) -> bool {

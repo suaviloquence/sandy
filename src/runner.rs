@@ -53,7 +53,7 @@ async fn control_sleep(rx: &mut mpsc::Receiver<Control>, until: Instant) -> Resu
             match msg {
                 Control::SkipCurr => {
                     // flush queue
-                    while rx.try_recv().is_ok() {} 
+                    while rx.try_recv().is_ok() {}
                     // with this, we lose the ~3 second buffer from each client
                     // time::sleep_until(until.into()).await;
                     return Err(msg);
@@ -82,7 +82,9 @@ impl Runner {
             &mut self.sender,
             Message::Frames(buffer.clone()),
             &self.current,
-        ).await.expect("Error sending");
+        )
+        .await
+        .expect("Error sending");
 
         let writer = async {
             *self.current.chunk.write().await = Some(buffer);
@@ -111,7 +113,9 @@ impl Runner {
                 &mut self.sender,
                 Message::Next(song.metadata.clone()),
                 &self.current,
-            ).await.expect("Error sending");
+            )
+            .await
+            .expect("Error sending");
             *self.current.song.write().await = Some(song.metadata.clone());
             const BUFFER_SIZE: usize = 128;
 

@@ -7,9 +7,9 @@ pub mod lastfm;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SongMetadata {
-	pub title: String,
-	pub artist: String,
-	pub youtube_url: Option<String>,
+    pub title: String,
+    pub artist: String,
+    pub youtube_url: Option<String>,
 }
 
 pub type Playlist = VecDeque<Song<Mp3>>;
