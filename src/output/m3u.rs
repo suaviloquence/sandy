@@ -17,7 +17,7 @@ pub fn generate_m3u8(
 		)
 		.expect("Error writing to string!");
 
-		writer(&mut m3u8, &*song).expect("Error writing to string in writer.");
+		writer(&mut m3u8, song).expect("Error writing to string in writer.");
 		m3u8.push_str("\r\n");
 	}
 

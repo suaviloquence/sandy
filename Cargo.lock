@@ -1012,6 +1012,7 @@ dependencies = [
  "futures",
  "hyper",
  "hyper-tls",
+ "lighthouse",
  "log",
  "scraper",
  "tokio",

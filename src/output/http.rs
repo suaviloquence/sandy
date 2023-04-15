@@ -1,15 +1,12 @@
 use std::{
-	collections::HashMap,
 	convert::Infallible,
 	fmt::Write,
 	net::SocketAddr,
 	sync::{
-		atomic::{AtomicUsize, Ordering},
-		Arc, Mutex,
+		Arc, Mutex, RwLock,
 	},
 };
 
-use futures::StreamExt;
 use hyper::{
 	body::Bytes,
 	header,
@@ -17,7 +14,6 @@ use hyper::{
 	service::{make_service_fn, service_fn},
 	Body, Request, Response,
 };
-use tokio::sync::mpsc;
 
 use crate::{
 	playlist::{Playlist, SongMetadata},
@@ -25,7 +21,7 @@ use crate::{
 	song::mp3::Frame,
 };
 
-use super::{Message, Receiver, Sender};
+use super::Message;
 
 #[derive(Debug)]
 struct BodyStream(hyper::body::Sender);
@@ -82,9 +78,8 @@ impl BodyStream {
 #[derive(Debug, Clone)]
 struct State {
 	playlist: Arc<Mutex<Playlist>>,
-	current: Current,
-	conns: Arc<tokio::sync::Mutex<HashMap<usize, Sender>>>,
-	conn_idx: Arc<AtomicUsize>,
+	rx: Arc<RwLock<lighthouse::Receiver<Message>>>,
+	current: Arc<Current>,
 	control: ControlSender,
 }
 
@@ -175,12 +170,7 @@ impl State {
 	}
 
 	async fn stream(self) -> hyper::http::Result<Response<Body>> {
-		let (sx, mut rx) = mpsc::channel(8);
-
-		self.conns
-			.lock()
-			.await
-			.insert(self.conn_idx.fetch_add(1, Ordering::Relaxed), sx);
+		let mut rx = self.rx.read().expect("RwLock poisoned").clone();
 
 		let (sx, body) = Body::channel();
 		let mut sx = BodyStream(sx);
@@ -213,12 +203,11 @@ impl State {
 		};
 
 		tokio::spawn(async move {
-			while let Some(msg) = rx.recv().await {
+			while let Ok(msg) = rx.recv().await {
 				let data = BodyStream::message_to_bytes(msg.as_ref());
 				drop(msg);
 
 				if !sx.send(data).await {
-					rx.close();
 					break;
 				}
 			}
@@ -238,49 +227,27 @@ impl State {
 
 #[derive(Debug)]
 pub struct Server {
-	rx: Receiver,
 	state: State,
 }
 
 impl Server {
 	pub fn new(
-		rx: Receiver,
+		rx: lighthouse::Receiver<Message>,
 		playlist: Arc<Mutex<Playlist>>,
-		current: Current,
+		current: Arc<Current>,
 		control: ControlSender,
 	) -> Self {
 		Self {
-			rx,
 			state: State {
 				current,
-				conns: Default::default(),
-				conn_idx: Default::default(),
+				rx: Arc::new(RwLock::new(rx)),
 				playlist,
 				control,
 			},
 		}
 	}
-
-	async fn worker(&mut self) {
-		while let Some(msg) = self.rx.recv().await {
-			let mut conns_guard = self.state.conns.lock().await;
-
-			let failures: Vec<_> = futures::stream::iter(conns_guard.iter().map(|(idx, sx)| {
-				let msg = Arc::clone(&msg);
-
-				async move { sx.send(msg).await.err().map(|_| *idx) }
-			}))
-			.filter_map(|x| async { x.await })
-			.collect()
-			.await;
-
-			for failure in failures {
-				conns_guard.remove(&failure);
-			}
-		}
-	}
-
-	pub async fn run_loop(mut self) {
+	
+	pub async fn run_loop(self) {
 		let addr = SocketAddr::from(([0, 0, 0, 0], 6912));
 
 		let state = self.state.clone();
@@ -294,7 +261,7 @@ impl Server {
 
 		let server = hyper::Server::bind(&addr).serve(make_service);
 
-		if let (_, Err(e)) = tokio::join!(self.worker(), server) {
+		if let Err(e) = server.await {
 			log::error!("Error running http: {:?}", e);
 		}
 	}

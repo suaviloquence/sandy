@@ -1,18 +1,14 @@
 use std::{
-	collections::HashMap,
 	io,
 	net::SocketAddr,
 	sync::{
-		atomic::{AtomicUsize, Ordering},
 		Arc,
 	},
 };
 
-use futures::{future, StreamExt};
 use tokio::{
 	io::AsyncWriteExt,
 	net::{tcp::OwnedWriteHalf, TcpListener},
-	sync::{mpsc, Mutex},
 };
 
 use crate::runner::Current;
@@ -21,55 +17,19 @@ use super::Message;
 
 #[derive(Debug)]
 pub struct Tcp {
-	rx: mpsc::Receiver<Arc<Message>>,
-	conns: Arc<Mutex<HashMap<usize, mpsc::Sender<Arc<Message>>>>>,
-	idx: AtomicUsize,
-	current: Current,
+	current: Arc<Current>,
 }
 
 impl Tcp {
-	pub fn new(rx: mpsc::Receiver<Arc<Message>>, current: Current) -> Self {
+	pub fn new(current: Arc<Current>) -> Self {
 		Self {
-			rx,
-			conns: Default::default(),
-			idx: AtomicUsize::new(0),
 			current,
 		}
 	}
 
 	pub async fn run_loop(self) -> io::Result<()> {
-		let queue = {
-			let mut rx = self.rx;
-			let conns = Arc::clone(&self.conns);
-
-			async move {
-				while let Some(msg) = rx.recv().await {
-					match msg.as_ref() {
-						Message::Frames(_) => {
-							let mut conns_guard = conns.lock().await;
-
-							let failures: Vec<usize> =
-								futures::stream::iter(conns_guard.iter().map(|(id, sx)| {
-									let msg = msg.clone();
-									async move { sx.send(msg).await.err().map(|_| id) }
-								}))
-								.filter_map(|x| x)
-								.collect()
-								.await;
-
-							for failure in &failures {
-								conns_guard.remove(failure);
-							}
-						}
-						_ => (),
-					}
-				}
-			}
-		};
-
 		let server = {
-			let conns = Arc::clone(&self.conns);
-			let current = self.current.clone();
+			let current = self.current;
 
 			async move {
 				let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 3615))).await?;
@@ -78,13 +38,8 @@ impl Tcp {
 					match listener.accept().await {
 						Ok((stream, _addr)) => {
 							let (_reader, writer) = stream.into_split();
-							let (sx, rx) = mpsc::channel(4);
-							conns
-								.lock()
-								.await
-								.insert(self.idx.fetch_add(1, Ordering::SeqCst), sx);
-
-							let current = current.clone();
+							let current = Arc::clone(&current);
+							let rx = current.tail.read().await.clone();
 
 							tokio::spawn(async move {
 								if let Err(e) = writer_loop(rx, writer, current).await {
@@ -100,14 +55,14 @@ impl Tcp {
 			}
 		};
 
-		future::join(queue, server).await.1
+		server.await
 	}
 }
 
 async fn writer_loop(
-	mut rx: mpsc::Receiver<Arc<Message>>,
+	mut rx: lighthouse::Receiver<Message>,
 	mut writer: OwnedWriteHalf,
-	current: Current,
+	current: Arc<Current>,
 ) -> io::Result<()> {
 	let guard = current.chunk.read().await;
 	if let Some(frames) = guard.as_ref() {
@@ -119,7 +74,7 @@ async fn writer_loop(
 
 	drop(guard);
 
-	while let Some(msg) = rx.recv().await {
+	while let Ok(msg) = rx.recv().await {
 		match msg.as_ref() {
 			Message::Next(_) => {
 				// writer.write(&id3).await?;

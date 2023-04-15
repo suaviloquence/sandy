@@ -12,7 +12,6 @@ mod output;
 mod playlist;
 mod runner;
 mod song;
-mod broadcast;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -36,6 +35,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 	};
 
 	let multi = getter::multi!(fs, ytdl);
+    
+	let sender = lighthouse::Sender::new();
 
 	let (control_sx, control_rx) = mpsc::channel(8);
 
@@ -45,26 +46,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 		.collect::<VecDeque<_>>()
 		.await;
 
-	let current = Current::default();
+	let current = Arc::new(Current::new(sender.subscribe()));
 
-	let (tcp_sx, rx) = mpsc::channel(8);
-	let tcp = output::tcp::Tcp::new(rx, current.clone());
+	let tcp = output::tcp::Tcp::new(Arc::clone(&current));
 	tokio::spawn(tcp.run_loop());
 
 	let playlist = Arc::new(std::sync::Mutex::new(playlist));
 
-	let (http_sx, rx) = mpsc::channel(8);
 	let http = output::http::Server::new(
-		rx,
+		sender.subscribe(),
 		Arc::clone(&playlist),
-		current.clone(),
+		Arc::clone(&current),
 		control_sx.clone(),
 	);
 	tokio::spawn(http.run_loop());
 
 	let runner = Runner {
 		receiver: control_rx,
-		services: [tcp_sx, http_sx],
+		sender,
 		playlist,
 		current,
 	};

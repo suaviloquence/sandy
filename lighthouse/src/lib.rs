@@ -3,15 +3,19 @@ use core::{
     mem,
     pin::Pin,
     task::{Context, Poll, Waker},
-    fmt::Debug,
 };
 
 use std::sync::{Arc, Mutex, RwLock};
 
+type TailRef<T> = Arc<Mutex<Tail<T>>>;
+// in future want to make this a std::sync::Weak ptr
+type TailRefWeak<T> = Arc<Mutex<Tail<T>>>;
+type NodeRef<T> = Arc<Node<T>>;
+
 #[derive(Debug)]
 struct Tail<T> {
     wakers: Vec<Waker>,
-    next: Option<Arc<Node<T>>>,
+    next: Option<NodeRef<T>>,
 }
 
 impl<T> Default for Tail<T> {
@@ -23,10 +27,11 @@ impl<T> Default for Tail<T> {
     }
 }
 
+
 #[derive(Debug)]
 enum Link<T> {
-    Next(Arc<Node<T>>),
-    Tail(Arc<Mutex<Tail<T>>>),
+    Next(NodeRef<T>),
+    Tail(TailRefWeak<T>),
 }
 
 impl<T> Default for Link<T> {
@@ -57,12 +62,20 @@ pub struct Sender<T> {
     curr: Link<T>,
     /// number of wakers expected to wait on the next message
     n: usize,
-    tail: Arc<Mutex<Tail<T>>>,
+    tail: TailRef<T>,
 }
 
 #[derive(Debug)]
 pub struct Receiver<T> {
     curr: Link<T>,
+}
+
+impl<T> Clone for Receiver<T> {
+    fn clone(&self) -> Self {
+        Self {
+            curr: self.curr.clone(),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -76,9 +89,15 @@ impl std::fmt::Display for SendError {
 
 impl std::error::Error for SendError {}
 
-// remove later
-impl<T: core::fmt::Debug> Sender<T> {
-    fn create_tail_node(n: usize) -> (Arc<Mutex<Tail<T>>>, Link<T>) {
+impl<T> Default for Sender<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> Sender<T> {
+    fn create_tail_node(n: usize) -> (TailRef<T>, Link<T>) {
         let tail = Arc::new(Mutex::new(Tail {
             wakers: Vec::with_capacity(n),
             next: None,
@@ -98,7 +117,7 @@ impl<T: core::fmt::Debug> Sender<T> {
         }
     }
 
-    pub async fn send(&mut self, msg: T) -> Result<(), SendError> {
+    pub fn send(&mut self, msg: T) -> Result<(), SendError> {
         // here, n will be two send()s behind, but we save a mutex lock().
         // we could do self.n = self.wakers.lock().len() here to change this tradeoff
         let (new_tail, next) = Self::create_tail_node(self.n);
@@ -115,7 +134,6 @@ impl<T: core::fmt::Debug> Sender<T> {
         let wakers = {
             let mut tail = self.tail.lock().map_err(|_| SendError)?;
             tail.next = Some(node);
-            dbg!(&*tail);
             mem::take(&mut tail.wakers)
         };
 
@@ -125,7 +143,6 @@ impl<T: core::fmt::Debug> Sender<T> {
         for waker in wakers {
             waker.wake();
         }
-
 
         Ok(())
     }
@@ -142,9 +159,33 @@ impl std::fmt::Display for RecvError {
 
 impl std::error::Error for RecvError {}
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MsgRef<T> {
-    inner: Arc<Node<T>>,
+    inner: NodeRef<T>,
+}
+
+impl<T> Clone for  MsgRef<T> {
+    fn clone(&self) -> Self {
+        Self { inner: Arc::clone(&self.inner) }
+    }
+}
+
+impl<T: PartialEq> PartialEq<T> for MsgRef<T> {
+    fn eq(&self, other: &T) -> bool {
+        &self.inner.msg == other
+    }
+}
+
+impl<T> AsRef<T> for MsgRef<T> {
+    fn as_ref(&self) -> &T {
+        &self.inner.msg
+    }
+}
+
+impl<T: PartialEq> PartialEq for MsgRef<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.msg == other.inner.msg
+    }
 }
 
 impl<T> core::ops::Deref for MsgRef<T> {
@@ -157,12 +198,11 @@ impl<T> core::ops::Deref for MsgRef<T> {
 
 #[derive(Debug)]
 struct RecvFut<T> {
-    tail: Arc<Mutex<Tail<T>>>,
+    tail: TailRefWeak<T>,
 }
 
-// TODO: remove type bound
-impl<T: Debug> Future for RecvFut<T> {
-    type Output = Result<Arc<Node<T>>, RecvError>;
+impl<T> Future for RecvFut<T> {
+    type Output = Result<NodeRef<T>, RecvError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut guard = match self.tail.lock() {
@@ -180,27 +220,53 @@ impl<T: Debug> Future for RecvFut<T> {
     }
 }
 
-// TODO: remove constraint
-impl<T: Debug> Receiver<T> {
+impl<T> Receiver<T> {
     fn try_recv_or_get_tail(
         &mut self,
-    ) -> Result<Result<MsgRef<T>, Arc<Mutex<Tail<T>>>>, RecvError> {
-        let next = match &self.curr {
-            Link::Next(node) => node.next.read().map_err(|_| RecvError)?.clone(),
+    ) -> Result<Result<MsgRef<T>, TailRefWeak<T>>, RecvError> {
+        match &self.curr {
+            Link::Next(node) => {
+                let next_guard = node.next.read().map_err(|_| RecvError)?;
+                match &*next_guard {
+                    Link::Next(node) => {
+                        let node = Arc::clone(node);
+                        drop(next_guard);
+                        self.curr = Link::Next(Arc::clone(&node));
+                        Ok(Ok(MsgRef { inner: node }))
+                    }
+                    Link::Tail(tail) => {
+                        let tail_guard = tail.lock().map_err(|_| RecvError)?;
+                        match &tail_guard.next {
+                            Some(node) => {
+                                let node = Arc::clone(node);
+                                drop(tail_guard);
+                                drop(next_guard);
+                                self.curr = Link::Next(Arc::clone(&node));
+                                Ok(Ok(MsgRef { inner: node }))
+                            }
+                            None => {
+                                drop(tail_guard);
+                                let tail = Arc::clone(tail);
+                                drop(next_guard);
+                                self.curr = Link::Tail(Arc::clone(&tail));
+                                Ok(Err(tail))
+                            }
+                        }
+                    }
+                }
+            }
             Link::Tail(t) => {
                 let tail_guard = t.lock().map_err(|_| RecvError)?;
                 match &tail_guard.next {
-                    Some(node) => Link::Next(Arc::clone(&node)),
-                    None => return Ok(Err(Arc::clone(&t))),
+                    Some(node) => {
+                        let node = Arc::clone(node);
+                        drop(tail_guard);
+                        self.curr = Link::Next(Arc::clone(&node));
+                        Ok(Ok(MsgRef { inner: node }))
+                    }
+                    None => Ok(Err(Arc::clone(t))),
                 }
             }
-        };
-        
-        self.curr = next.clone();
-        
-        match next {
-            Link::Next(inner) => Ok(Ok(MsgRef { inner })),
-            Link::Tail(t) => Ok(Err(t)),
         }
     }
 
@@ -226,80 +292,178 @@ impl<T: Debug> Receiver<T> {
 mod tests {
     use crate::*;
     type Err = Box<dyn std::error::Error>;
-    
-    impl<T> PartialEq for Tail<T> {
+
+
+    impl<T: PartialEq> PartialEq for Node<T> {
         fn eq(&self, other: &Self) -> bool {
-            self as *const _ == other as *const _
+            self.msg == other.msg
         }
     }
-    
-    impl<T> PartialEq for Link<T> {
+
+    impl<T: PartialEq> PartialEq for Tail<T> {
+        fn eq(&self, other: &Self) -> bool {
+            self.next == other.next
+        }
+    }
+
+    impl<T: PartialEq> PartialEq for Link<T> {
         fn eq(&self, other: &Self) -> bool {
             match (self, other) {
                 (Link::Next(a), Link::Next(b)) => a == b,
-                (Link::Tail())
+                (Link::Tail(a), Link::Tail(b)) => Arc::ptr_eq(a, b),
+                _ => false,
             }
         }
     }
 
-    impl<T> Link<T> {
-        fn next(&self) -> &Arc<Node<T>> {
-            match self {
-                Link::Next(n) => n,
-                Link::Tail(t) => unreachable!("not next")
-            }
-        }
-
-        fn tail(&self) -> &Arc<Mutex<Tail<T>>> {
-            match self {
-                Link::Next(n) => unreachable!("not tail"),
-                Link::Tail(t) => t
-            }
+    fn assert_ptr_eq<T: core::fmt::Debug>(a: &Arc<T>, b: &Arc<T>) {
+        if !Arc::ptr_eq(a, b) {
+            panic!("Assertion failed; a != b\n - a: `{:?}`\n - b: `{:?}`", a, b);
         }
     }
-    
+
+    // test of internals
     #[test]
-    fn recv_cases() {
-        // N -> N
-        let head = Link::Next(Arc::new(Node {
+    fn recv_cases() -> Result<(), Err> {
+        // Next(a) -> Next(b): should return Ok(b) and update `curr` to b
+        let next = Arc::new(Node {
+            msg: 2i32,
+            next: Default::default(),
+        });
+        let head = Arc::new(Node {
             msg: 1,
-            next: RwLock::new(Link::Next(Arc::new(Node {
-                msg: 2,
-                next: Default::default(),
-            })))
-        }));
-        
+            next: RwLock::new(Link::Next(Arc::clone(&next))),
+        });
 
-        assert_eq!(*rx.try_recv_or_get_tail().unwrap().unwrap(), 2);
-        assert_eq!(rx.curr, head.next().next.into_inner().unwrap());
+        let mut rx = Receiver {
+            curr: Link::Next(Arc::clone(&head)),
+        };
+        assert_eq!(rx.try_recv_or_get_tail()?.unwrap(), 2);
+        assert_eq!(rx.curr, Link::Next(next));
+
+        // Next(a) -> Tail(b) -> None: should return Err(b) and update `curr` to b
+        let next = Arc::default();
+        let head = Arc::new(Node {
+            msg: 1i32,
+            next: RwLock::new(Link::Tail(Arc::clone(&next))),
+        });
+        let mut rx = Receiver {
+            curr: Link::Next(Arc::clone(&head)),
+        };
+
+        assert!(Arc::ptr_eq(&rx.try_recv_or_get_tail()?.unwrap_err(), &next));
+        assert_eq!(rx.curr, Link::Tail(next));
+
+        // Next(a) -> Tail(b) -> Some(Next(c)): should return Ok(c) and update curr to c
+        let next = Arc::new(Node {
+            msg: 2i32,
+            next: Default::default(),
+        });
+        let head = Arc::new(Node {
+            msg: 1i32,
+            next: RwLock::new(Link::Tail(Arc::new(Mutex::new(Tail {
+                next: Some(Arc::clone(&next)),
+                ..Default::default()
+            })))),
+        });
+
+        let mut rx = Receiver {
+            curr: Link::Next(Arc::clone(&head)),
+        };
+
+        assert_eq!(rx.try_recv_or_get_tail()?.unwrap(), 2);
+        assert_eq!(rx.curr, Link::Next(next));
+
+        // Tail(a) -> None: should return Err(a) and `curr` should remain a
+        let node = Arc::default();
+        let mut rx: Receiver<()> = Receiver {
+            curr: Link::Tail(Arc::clone(&node)),
+        };
+        assert_ptr_eq(&rx.try_recv_or_get_tail()?.unwrap_err(), &node);
+        assert_eq!(rx.curr, Link::Tail(node));
+
+        // Tail(a) -> Some(Node(b)): should return Ok(b) and `curr` should be b
+        let next = Arc::new(Node {
+            msg: 1,
+            next: Default::default(),
+        });
+
+        let head = Arc::new(Mutex::new(Tail {
+            next: Some(Arc::clone(&next)),
+            ..Default::default()
+        }));
+
+        let mut rx = Receiver {
+            curr: Link::Tail(Arc::clone(&head)),
+        };
+        assert_eq!(rx.try_recv_or_get_tail()?.unwrap(), 1);
+        assert_eq!(rx.curr, Link::Next(next));
+
+        Ok(())
     }
 
     #[tokio::test]
     async fn synchronized() -> Result<(), Err> {
         let mut sx = Sender::new();
         let mut rx = sx.subscribe();
-        
-        sx.send(1).await?;
-        assert_eq!(rx.try_recv()?.as_deref().copied(), Some(1));
+
+        sx.send(1)?;
+        assert_eq!(rx.recv().await?, 1);
+        assert_eq!(rx.try_recv()?, None);
+        sx.send(2)?;
+        sx.send(3)?;
+        assert_eq!(rx.recv().await?, 2);
+        assert_eq!(rx.recv().await?, 3);
+        assert_eq!(rx.try_recv()?, None);
 
         Ok(())
     }
 
-    #[ignore]
+    #[test]
+    fn multiple_rx() -> Result<(), Err> {
+        let mut sx = Sender::new();
+
+        let mut r1 = sx.subscribe();
+        let mut r2 = sx.subscribe();
+
+        sx.send(1i32)?;
+
+        let mut r3 = sx.subscribe();
+        sx.send(2i32)?;
+
+        assert_eq!(r1.try_recv()?.unwrap(), 1);
+        assert_eq!(r3.try_recv()?.unwrap(), 2);
+
+        assert_eq!(r1.try_recv()?.unwrap(), 2);
+        assert_eq!(r1.try_recv()?, None);
+        assert_eq!(r3.try_recv()?, None);
+
+        assert_eq!(r2.try_recv()?.unwrap(), 1);
+        assert_eq!(r2.try_recv()?.unwrap(), 2);
+        assert_eq!(r2.try_recv()?, None);
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn basic_functionality() -> Result<(), Err> {
         let mut sx = Sender::new();
         let mut rx = sx.subscribe();
 
         let f1 = async move {
-            sx.send(2).await?;
-            sx.send(3).await?;
+            sx.send(2)?;
+            sx.send(3)?;
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            sx.send(4)?;
+
             Ok::<_, Err>(())
         };
 
         let f2 = async move {
-            assert_eq!(*rx.recv().await?, 2);
-            assert_eq!(*rx.recv().await?, 3);
+            assert_eq!(rx.recv().await?, 2);
+            assert_eq!(rx.recv().await?, 3);
+            assert_eq!(rx.recv().await?, 4);
+            assert_eq!(rx.try_recv()?, None);
 
             Ok::<_, Err>(())
         };
