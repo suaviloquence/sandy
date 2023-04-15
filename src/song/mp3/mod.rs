@@ -123,7 +123,7 @@ impl Song<Mp3> {
 		})
 	}
 
-	pub fn frames<'a>(&'a self) -> impl Iterator<Item = Frame> + 'a {
+	pub fn frames(&self) -> impl Iterator<Item = Frame> + '_ {
 		let mut cursor = Cursor::new(&self.data);
 
 		// skip ID3 tags

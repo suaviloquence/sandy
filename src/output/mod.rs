@@ -1,7 +1,3 @@
-use std::sync::Arc;
-
-use tokio::sync::mpsc;
-
 use crate::{playlist::SongMetadata, song::mp3::Frame};
 
 pub mod http;
@@ -13,6 +9,3 @@ pub enum Message {
 	Next(SongMetadata),
 	Frames(Vec<Frame>),
 }
-
-pub type Sender = mpsc::Sender<Arc<Message>>;
-pub type Receiver = mpsc::Receiver<Arc<Message>>;

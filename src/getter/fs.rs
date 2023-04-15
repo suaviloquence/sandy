@@ -26,7 +26,7 @@ impl AsRef<str> for Ext {
 impl AsRef<OsStr> for Ext {
 	#[inline]
 	fn as_ref(&self) -> &OsStr {
-		&str::as_ref(self.as_ref())
+		str::as_ref(self.as_ref())
 	}
 }
 
