@@ -54,7 +54,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let playlist = Arc::new(std::sync::Mutex::new(playlist));
 
     let http = output::http::Server::new(
-        sender.subscribe(),
         Arc::clone(&playlist),
         Arc::clone(&current),
         control_sx.clone(),

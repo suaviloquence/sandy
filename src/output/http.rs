@@ -2,7 +2,7 @@ use std::{
     convert::Infallible,
     fmt::Write,
     net::SocketAddr,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex},
 };
 
 use hyper::{
@@ -76,7 +76,6 @@ impl BodyStream {
 #[derive(Debug, Clone)]
 struct State {
     playlist: Arc<Mutex<Playlist>>,
-    rx: Arc<RwLock<lighthouse::Receiver<Message>>>,
     current: Arc<Current>,
     control: ControlSender,
 }
@@ -168,7 +167,7 @@ impl State {
     }
 
     async fn stream(self) -> hyper::http::Result<Response<Body>> {
-        let mut rx = self.rx.read().expect("RwLock poisoned").clone();
+        let mut rx = self.current.tail.read().await.clone();
 
         let (sx, body) = Body::channel();
         let mut sx = BodyStream(sx);
@@ -230,7 +229,6 @@ pub struct Server {
 
 impl Server {
     pub fn new(
-        rx: lighthouse::Receiver<Message>,
         playlist: Arc<Mutex<Playlist>>,
         current: Arc<Current>,
         control: ControlSender,
@@ -238,7 +236,6 @@ impl Server {
         Self {
             state: State {
                 current,
-                rx: Arc::new(RwLock::new(rx)),
                 playlist,
                 control,
             },

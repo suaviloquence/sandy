@@ -70,7 +70,7 @@ async fn send(
     current: &Current,
 ) -> Result<(), lighthouse::SendError> {
     sx.send(msg)?;
-    let _ = current.tail.write().await.try_recv();
+    current.tail.write().await.try_recv().expect("Error advancing current");
     Ok(())
 }
 
