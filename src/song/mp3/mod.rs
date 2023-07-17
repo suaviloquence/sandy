@@ -1,9 +1,10 @@
 use self::data::{Layer, Version};
-use super::{Song, Codec};
+use super::{Codec, Song};
 use crate::playlist::SongMetadata;
+use futures::future::BoxFuture;
+use futures::{AsyncWrite, AsyncWriteExt};
 use id3::Id3;
 use std::io::{self, BufRead, BufReader, Cursor, Read, Seek};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 mod data;
 
@@ -33,11 +34,12 @@ impl Header {
             0b11 => Version::V1,
             0b10 => Version::V2,
             0b00 => Version::V2_5,
-			// invalid layer
-            _ =>  {
-				#[allow(unconditional_panic)]
-				[][1]
-			}
+            // invalid layer
+            _ =>
+            {
+                #[allow(unconditional_panic)]
+                [][1]
+            }
         }
     }
 
@@ -47,11 +49,12 @@ impl Header {
             0b11 => Layer::L1,
             0b10 => Layer::L2,
             0b01 => Layer::L3,
-			// invalid layer, can't panic in const fn
-            _ => {
-				#[allow(unconditional_panic)]
-				[][1]
-			}
+            // invalid layer, can't panic in const fn
+            _ =>
+            {
+                #[allow(unconditional_panic)]
+                [][1]
+            }
         }
     }
 
@@ -96,9 +99,15 @@ pub struct Frame {
     pub data: Vec<u8>,
 }
 
-impl Frame {
-    pub async fn write(&self, mut w: impl AsyncWrite + Unpin) -> io::Result<usize> {
-        Ok(w.write(&self.header[..]).await? + w.write(&self.data).await?)
+impl super::Frame for Frame {
+    type Future = BoxFuture<'static, io::Result<usize>>;
+
+    fn write<W: AsyncWrite + Unpin + Send>(&self, mut w: W) -> Self::Future {
+        Box::pin(async move { Ok(w.write(&self.header[..]).await? + w.write(&self.data).await?) })
+    }
+    
+    fn into_bytes(self) -> io::Result<Vec<u8>> {
+        Ok(self.header.0.into_iter().chain(self.data.into_iter()).collect())
     }
 }
 
@@ -107,10 +116,11 @@ pub struct Mp3;
 
 impl Codec for Mp3 {
     const MIME_TYPE: &'static str = "audio/mpeg";
-}
 
-impl Song<Mp3> {
-    pub fn load(metadata: SongMetadata, data: impl Read + Seek) -> io::Result<Self> {
+    type Frame = Frame;
+    type Iterator<'a> = FrameIterator<Cursor<&'a Vec<u8>>>;
+
+    fn load(metadata: SongMetadata, data: impl Read + Seek) -> io::Result<Song<Self>> {
         let mut reader = BufReader::new(data);
         let mut data = Vec::new();
         reader.read_to_end(&mut data)?;
@@ -121,7 +131,7 @@ impl Song<Mp3> {
         let mut source = reader.into_inner();
         source.rewind()?;
 
-        Ok(Self {
+        Ok(Song {
             metadata,
             data,
             duration,
@@ -129,15 +139,15 @@ impl Song<Mp3> {
         })
     }
 
-    pub fn frames(&self) -> impl Iterator<Item = Frame> + '_ {
-        let mut cursor = Cursor::new(&self.data);
+    fn frames(song: &Song<Self>) -> Self::Iterator<'_> {
+        let mut cursor = Cursor::new(&song.data);
 
         // skip ID3 tags
         let _ = Id3::read(&mut cursor);
 
         // move to next 0xFF
-        for i in cursor.position() as usize..self.data.len() {
-            if self.data[i] == 0xFF {
+        for i in cursor.position() as usize..song.data.len() {
+            if song.data[i] == 0xFF {
                 cursor.set_position(i as u64);
                 break;
             }
@@ -146,6 +156,9 @@ impl Song<Mp3> {
 
         FrameIterator { cursor }
     }
+}
+
+impl Song<Mp3> {
 }
 #[derive(Debug)]
 struct FrameIterator<R> {

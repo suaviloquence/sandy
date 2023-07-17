@@ -118,6 +118,14 @@ impl Runner {
             .expect("Error sending");
             *self.current.song.write().await = Some(song.metadata.clone());
             const BUFFER_SIZE: usize = 128;
+            
+            tokio::spawn({
+                let dur = song.duration;
+                log::info!("Duration is {}", dur);
+                async move {
+                    tokio::time::sleep(tokio::time::Duration::from_secs_f64(dur)).await;
+                    log::info!("Song should end now");
+            }});
 
             let mut buffer = Vec::with_capacity(BUFFER_SIZE);
             let mut duration = 0.;
